@@ -41,17 +41,30 @@ local CONFIG = {
         ["Tank"] = {
             name = "M1 Abrams Tank",
             type = "M-1 Abrams",
-            mass = 60000  -- Mass in kg for an M1 Abrams
+            mass = 60000,  -- Mass in kg for an M1 Abrams
+            category = "vehicle",
+            materials_required = 2
         },
         ["APC"] = {
             name = "M113 APC",
             type = "M-113",
-            mass = 11000  -- Mass in kg for an M113
+            mass = 11000,  -- Mass in kg for an M113
+            category = "vehicle",
+            materials_required = 2
         },
         ["Humvee"] = {
             name = "M1025 HMMWV",
             type = "Hummer",
-            mass = 2400   -- Mass in kg for a HMMWV
+            mass = 2400,   -- Mass in kg for a HMMWV
+            category = "vehicle",
+            materials_required = 2
+        },
+        ["FARP"] = {
+            name = "Forward Arming and Refueling Point",
+            type = "FARP",
+            mass = 50000,  -- Mass in kg for FARP equipment
+            category = "static",
+            materials_required = 4
         }
     }
 }
@@ -455,22 +468,34 @@ local function handleMakeCommand(marker, vehicleType)
         if crateData.unit and crateData.unit:isExist() then
             if crateData.been_airborne and crateData.isOnGround then
                 airborneOrLandedCrates = airborneOrLandedCrates + 1
-                local cratePos = crateData.unit:getPoint()
-                if cratePos then
-                    local dx = cratePos.x - marker.pos.x
-                    local dz = cratePos.z - marker.pos.z
-                    local distance = math.sqrt(dx * dx + dz * dz)
+                
+                -- For FARP, only accept container_cargo containers
+                local containerTypeMatch = true
+                if vehicleType == "FARP" then
+                    containerTypeMatch = string.find(crateName, "^container_cargo%-") ~= nil
+                    debugMsg("[FARP-CHECK] FARP requires container_cargo, checking " .. crateName .. ": " .. tostring(containerTypeMatch))
+                end
+                
+                if containerTypeMatch then
+                    local cratePos = crateData.unit:getPoint()
+                    if cratePos then
+                        local dx = cratePos.x - marker.pos.x
+                        local dz = cratePos.z - marker.pos.z
+                        local distance = math.sqrt(dx * dx + dz * dz)
 
-                    debugMsg("[DISTANCE] Crate " .. crateName .. " at distance: " .. math.floor(distance) .. "m")
+                        debugMsg("[DISTANCE] Crate " .. crateName .. " at distance: " .. math.floor(distance) .. "m")
 
-                    if distance <= searchRadius then
-                        table.insert(nearbyCrates, {name = crateName, data = crateData, distance = distance})
-                        debugMsg("[FOUND] Found nearby landed crate: " .. crateName .. " (distance: " .. math.floor(distance) .. "m)")
+                        if distance <= searchRadius then
+                            table.insert(nearbyCrates, {name = crateName, data = crateData, distance = distance})
+                            debugMsg("[FOUND] Found nearby landed crate: " .. crateName .. " (distance: " .. math.floor(distance) .. "m)")
+                        else
+                            debugMsg("[SKIP] Crate " .. crateName .. " too far: " .. math.floor(distance) .. "m")
+                        end
                     else
-                        debugMsg("[SKIP] Crate " .. crateName .. " too far: " .. math.floor(distance) .. "m")
+                        debugMsg("[ERROR] Could not get position for crate: " .. crateName)
                     end
                 else
-                    debugMsg("[ERROR] Could not get position for crate: " .. crateName)
+                    debugMsg("[SKIP] Crate " .. crateName .. " wrong type for FARP (need container_cargo)")
                 end
             else
                 debugMsg("[SKIP] Crate " .. crateName .. " not eligible (not airborne+landed)")
@@ -482,8 +507,8 @@ local function handleMakeCommand(marker, vehicleType)
 
     debugMsg("[SUMMARY] Crate Summary: " .. totalTrackedCrates .. " total tracked, " .. airborneOrLandedCrates .. " airborne+landed, " .. #nearbyCrates .. " nearby")
 
-    -- Check if we have enough materials (need 2 crates per vehicle)
-    local requiredCrates = 2
+    -- Check if we have enough materials (varies by item type)
+    local requiredCrates = cargoConfig.materials_required or 2
     if #nearbyCrates < requiredCrates then
         debugMsg("[ERROR] Insufficient materials for " .. cargoConfig.name .. " - need " .. requiredCrates .. " landed crates, found " .. #nearbyCrates)
         debugMsg("[ERROR] MANUFACTURING FAILED: Need " .. requiredCrates .. " landed containers near marker to build " .. cargoConfig.name)
@@ -500,82 +525,107 @@ local function handleMakeCommand(marker, vehicleType)
     -- Sort crates by distance to use the closest ones
     table.sort(nearbyCrates, function(a, b) return a.distance < b.distance end)
 
-    -- Select only the 2 closest crates for manufacturing
+    -- Select the closest crates for manufacturing
     local selectedCrates = {}
     for i = 1, requiredCrates do
         selectedCrates[i] = nearbyCrates[i]
         debugMsg("[MATERIALS] Selected crate " .. i .. ": " .. selectedCrates[i].name .. " (distance: " .. math.floor(selectedCrates[i].distance) .. "m)")
     end
 
-    -- Spawn the vehicle at marker location
-    local vehicleCounter = (AirDropState.makeCounter or 0) + 1
-    AirDropState.makeCounter = vehicleCounter
+    -- Spawn the item at marker location
+    local itemCounter = (AirDropState.makeCounter or 0) + 1
+    AirDropState.makeCounter = itemCounter
 
-    local vehicleGroupName = "Made_" .. vehicleType .. "_Group_" .. vehicleCounter
-    local vehicleUnitName = "Made_" .. vehicleType .. "_" .. vehicleCounter
+    local itemName = "Made_" .. vehicleType .. "_" .. itemCounter
 
-    local vehicleGroupData = {
-        ["visible"] = false,
-        ["taskSelected"] = true,
-        ["groupId"] = math.random(1000, 9999),
-        ["hidden"] = false,
-        ["units"] = {
-            [1] = {
-                ["type"] = cargoConfig.type,
-                ["unitId"] = math.random(10000, 99999),
-                ["skill"] = "Average",
-                ["y"] = marker.pos.z,
-                ["x"] = marker.pos.x,
-                ["name"] = vehicleUnitName,
-                ["heading"] = 0,
-                ["playerCanDrive"] = true,
-            }
-        },
-        ["y"] = marker.pos.z,
-        ["x"] = marker.pos.x,
-        ["name"] = vehicleGroupName,
-        ["start_time"] = 0,
-        ["task"] = "Ground Nothing",
-        ["route"] = {
-            ["spans"] = {},
-            ["points"] = {
+    local spawnSuccess = false
+    local spawnResult = nil
+
+    if cargoConfig.category == "static" then
+        -- Spawn static object (like FARP)
+        local staticData = {
+            ["type"] = cargoConfig.type,
+            ["unitId"] = math.random(10000, 99999),
+            ["y"] = marker.pos.z,
+            ["x"] = marker.pos.x,
+            ["name"] = itemName,
+            ["heading"] = 0,
+            ["dead"] = false,
+        }
+
+        debugMsg("[SPAWN] Attempting to spawn static object: " .. itemName)
+        debugMsg("[SPAWN] Static type: " .. cargoConfig.type .. " (" .. cargoConfig.name .. ")")
+        debugMsg("[SPAWN] Spawn position: x=" .. marker.pos.x .. ", z=" .. marker.pos.z)
+        debugMsg("[SPAWN] Unit ID: " .. staticData.unitId)
+
+        spawnSuccess, spawnResult = pcall(coalition.addStaticObject, country.id.USA, staticData)
+    else
+        -- Spawn vehicle group
+        local vehicleGroupName = "Made_" .. vehicleType .. "_Group_" .. itemCounter
+        local vehicleUnitName = "Made_" .. vehicleType .. "_" .. itemCounter
+        
+        local vehicleGroupData = {
+            ["visible"] = false,
+            ["taskSelected"] = true,
+            ["groupId"] = math.random(1000, 9999),
+            ["hidden"] = false,
+            ["units"] = {
                 [1] = {
-                    ["alt"] = 0,
-                    ["type"] = "Turning Point",
-                    ["ETA"] = 0,
-                    ["alt_type"] = "BARO",
-                    ["formation_template"] = "",
+                    ["type"] = cargoConfig.type,
+                    ["unitId"] = math.random(10000, 99999),
+                    ["skill"] = "Average",
                     ["y"] = marker.pos.z,
                     ["x"] = marker.pos.x,
-                    ["name"] = "",
-                    ["ETA_locked"] = true,
-                    ["speed"] = 0,
-                    ["action"] = "Off Road",
-                    ["task"] = {
-                        ["id"] = "ComboTask",
-                        ["params"] = {
-                            ["tasks"] = {}
-                        }
-                    },
-                    ["speed_locked"] = true,
+                    ["name"] = vehicleUnitName,
+                    ["heading"] = 0,
+                    ["playerCanDrive"] = true,
+                }
+            },
+            ["y"] = marker.pos.z,
+            ["x"] = marker.pos.x,
+            ["name"] = vehicleGroupName,
+            ["start_time"] = 0,
+            ["task"] = "Ground Nothing",
+            ["route"] = {
+                ["spans"] = {},
+                ["points"] = {
+                    [1] = {
+                        ["alt"] = 0,
+                        ["type"] = "Turning Point",
+                        ["ETA"] = 0,
+                        ["alt_type"] = "BARO",
+                        ["formation_template"] = "",
+                        ["y"] = marker.pos.z,
+                        ["x"] = marker.pos.x,
+                        ["name"] = "",
+                        ["ETA_locked"] = true,
+                        ["speed"] = 0,
+                        ["action"] = "Off Road",
+                        ["task"] = {
+                            ["id"] = "ComboTask",
+                            ["params"] = {
+                                ["tasks"] = {}
+                            }
+                        },
+                        ["speed_locked"] = true,
+                    }
                 }
             }
         }
-    }
 
-    debugMsg("[SPAWN] Attempting to spawn vehicle group: " .. vehicleGroupName)
-    debugMsg("[SPAWN] Vehicle type: " .. cargoConfig.type .. " (" .. cargoConfig.name .. ")")
-    debugMsg("[SPAWN] Spawn position: x=" .. marker.pos.x .. ", z=" .. marker.pos.z)
-    debugMsg("[SPAWN] Group ID: " .. vehicleGroupData.groupId .. ", Unit ID: " .. vehicleGroupData.units[1].unitId)
+        debugMsg("[SPAWN] Attempting to spawn vehicle group: " .. vehicleGroupName)
+        debugMsg("[SPAWN] Vehicle type: " .. cargoConfig.type .. " (" .. cargoConfig.name .. ")")
+        debugMsg("[SPAWN] Spawn position: x=" .. marker.pos.x .. ", z=" .. marker.pos.z)
+        debugMsg("[SPAWN] Group ID: " .. vehicleGroupData.groupId .. ", Unit ID: " .. vehicleGroupData.units[1].unitId)
 
-    -- Spawn the vehicle
-    local vehicleSuccess, vehicleResult = pcall(coalition.addGroup, country.id.USA, Group.Category.GROUND, vehicleGroupData)
+        spawnSuccess, spawnResult = pcall(coalition.addGroup, country.id.USA, Group.Category.GROUND, vehicleGroupData)
+    end
 
-    if vehicleSuccess then
-        debugMsg("[SUCCESS] " .. cargoConfig.name .. " spawned successfully: " .. vehicleGroupName)
-        debugMsg("[MAKE] VEHICLE MANUFACTURED: " .. cargoConfig.name .. " created from nearby materials!")
+    if spawnSuccess then
+        debugMsg("[SUCCESS] " .. cargoConfig.name .. " spawned successfully: " .. itemName)
+        debugMsg("[MAKE] ITEM MANUFACTURED: " .. cargoConfig.name .. " created from " .. requiredCrates .. " containers!")
 
-        -- Despawn the selected 2 crates used as materials
+        -- Despawn the selected crates used as materials
         local despawnedCount = 0
         debugMsg("[CLEANUP] Processing " .. requiredCrates .. " selected crates for despawn...")
         for i, crateInfo in ipairs(selectedCrates) do
@@ -602,9 +652,8 @@ local function handleMakeCommand(marker, vehicleType)
         debugMsg("[SUCCESS] Removed make command marker")
 
     else
-        debugMsg("[ERROR] Failed to spawn " .. cargoConfig.name .. ": " .. tostring(vehicleResult))
-        debugMsg("[ERROR] Error details: " .. tostring(vehicleResult))
-        debugMsg("[ERROR] Group data: " .. tostring(vehicleGroupData))
+        debugMsg("[ERROR] Failed to spawn " .. cargoConfig.name .. ": " .. tostring(spawnResult))
+        debugMsg("[ERROR] Error details: " .. tostring(spawnResult))
     end
 
     debugMsg("[MAKE] ================ MAKE COMMAND COMPLETE =================")
@@ -673,6 +722,8 @@ local function scanForMakeCommands()
                     vehicleType = "APC"
                 elseif vehicleTypeText == "HUMVEE" then
                     vehicleType = "Humvee"
+                elseif vehicleTypeText == "FARP" then
+                    vehicleType = "FARP"
                 end
 
                 if vehicleType and CONFIG.cargo_types[vehicleType] then
