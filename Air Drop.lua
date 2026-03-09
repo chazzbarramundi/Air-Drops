@@ -1,4 +1,4 @@
--- Air Drop 0.3 By Burning Skies MYTH
+-- Air Drop 0.4 By Burning Skies MYTH
 -- Pure DCS Lua
 -- Description: This script adds Air Drop radio commands that will spawn C-130's and deliver units to a designated
 --              map marker to drop cargo. You can also spawn and track the c130 supply containers dropped by players and use 
@@ -42,6 +42,13 @@ local CONFIG = {
 
     -- Cargo settings for NPC air drops
     cargo_types = {
+        ["SupplyTruck"] = {
+            name = "Truck M818",
+            type = "M 818",  -- DCS unit type name for the M818 truck
+            mass = 60000,  -- Mass in kg for an M818
+            category = "vehicle",
+            materials_required = 1
+        },
         ["Tank"] = {
             name = "M1 Abrams Tank",
             type = "M-1 Abrams",
@@ -77,6 +84,20 @@ local CONFIG = {
             category = "vehicle",
             materials_required = 3
         },
+        ["SRSAM"] = {
+            name = "Short Range SAM",
+            type = "SAM_UNITS",
+            mass = 25000,  -- Mass in kg for Short Range SAM
+            category = "SAM_UNITS",
+            materials_required = 5
+        },
+        ["LRSAM"] = {
+            name = "Long Range SAM",
+            type = "SAM_UNITS",
+            mass = 25000,  -- Mass in kg for Long Range SAM
+            category = "SAM_UNITS",
+            materials_required = 5
+        },
         ["FARP"] = {
             name = "Forward Arming and Refueling Point",
             type = "FARP",
@@ -84,7 +105,38 @@ local CONFIG = {
             category = "static",
             materials_required = 4
         }
-    }
+    },
+
+    -- SAM Deployment Settings
+    SAM_DEPLOYMENT = {
+        UNIT_SPACING = 30,              -- Base distance between SAM units in meters
+        MAX_RANDOM_OFFSET = 15,         -- Maximum random offset from calculated position
+        ENABLE_RANDOM_HEADING = true,   -- Give each unit a random heading
+        ENABLE_POSITION_RANDOMIZATION = true,  -- Enable position randomization
+    },
+
+    SAM_UNITS = {
+        SRSAM = {
+            [country.id.CJTF_BLUE] = {
+                { type = "M 818", skill = "High" },
+                { type = "NASAMS_Command_Post", skill = "High" },
+                { type = "NASAMS_Radar_MPQ64F1", skill = "High" },
+                { type = "NASAMS_LN_B", skill = "High" }
+            },
+        },
+        LRSAM = {
+            [country.id.CJTF_BLUE] = {
+                { type = "M 818", skill = "High" },
+                { type = "Hawk cwar", skill = "High" },
+                { type = "Hawk ln", skill = "High" },
+                { type = "Hawk ln", skill = "High" },
+                { type = "Hawk pcp", skill = "High" },
+                { type = "Hawk sr", skill = "High" },
+                { type = "Hawk tr", skill = "High" },
+            },
+        },
+    },
+
 }
 
 
@@ -463,6 +515,136 @@ end
 -- AIR DROP FUNCTIONS
 -- =====================================================================================
 
+-- Function to spawn SAM group with randomized positioning (based on REINFORCED script)
+local function spawnSAMGroup(samType, groupBaseName, markerX, markerZ)
+    debugMsg("[SAM] ================ SAM GROUP SPAWNING =================")
+    debugMsg("[SAM] SAM Type: " .. tostring(samType))
+    debugMsg("[SAM] Group Base Name: " .. tostring(groupBaseName))
+    debugMsg("[SAM] Marker Position: x=" .. markerX .. ", z=" .. markerZ)
+
+    -- Get SAM unit configuration
+    debugMsg("[SAM] Looking up SAM type: " .. samType .. " in CONFIG.SAM_UNITS")
+    local samUnits = CONFIG.SAM_UNITS[samType] and CONFIG.SAM_UNITS[samType][country.id.CJTF_BLUE] or nil
+    if not samUnits then
+        debugMsg("[ERROR] No SAM units configured for type: " .. samType .. " and coalition: " .. tostring(country.id.CJTF_BLUE), true)
+        -- Debug: show available SAM types
+        local availableTypes = {}
+        for samTypeName, _ in pairs(CONFIG.SAM_UNITS or {}) do
+            table.insert(availableTypes, samTypeName)
+        end
+        debugMsg("[DEBUG] Available SAM types: " .. table.concat(availableTypes, ", "), true)
+        return false
+    end
+
+    debugMsg("[SUCCESS] Found " .. #samUnits .. " SAM units to spawn for " .. samType)
+
+    -- Create unique group name
+    local groupName = groupBaseName .. "_SAM_Group_" .. math.random(100, 999)
+    
+    -- Create group data structure
+    local groupData = {
+        ["visible"] = false,
+        ["tasks"] = {},
+        ["uncontrollable"] = false,
+        ["task"] = "Ground Nothing",
+        ["taskSelected"] = true,
+        ["route"] = {
+            ["spans"] = {},
+            ["points"] = {
+                [1] = {
+                    ["alt"] = 0,
+                    ["type"] = "Turning Point",
+                    ["ETA"] = 0,
+                    ["alt_type"] = "BARO",
+                    ["formation_template"] = "",
+                    ["y"] = markerZ,
+                    ["x"] = markerX,
+                    ["ETA_locked"] = false,
+                    ["speed"] = 0,
+                    ["action"] = "Off Road",
+                    ["task"] = {
+                        ["id"] = "ComboTask",
+                        ["params"] = { ["tasks"] = {} }
+                    },
+                    ["speed_locked"] = true,
+                }
+            }
+        },
+        ["groupId"] = math.random(1000, 9999),
+        ["hidden"] = false,
+        ["units"] = {},
+        ["y"] = markerZ,
+        ["x"] = markerX,
+        ["name"] = groupName,
+        ["start_time"] = 0,
+    }
+
+    -- Add units with randomized positioning
+    local unitSpacing = CONFIG.SAM_DEPLOYMENT.UNIT_SPACING or 30
+    local maxRandomOffset = CONFIG.SAM_DEPLOYMENT.MAX_RANDOM_OFFSET or 15
+    local enableRandomHeading = CONFIG.SAM_DEPLOYMENT.ENABLE_RANDOM_HEADING
+    local enableRandomization = CONFIG.SAM_DEPLOYMENT.ENABLE_POSITION_RANDOMIZATION
+    
+    for i, samUnit in ipairs(samUnits) do
+        local unitX, unitZ
+        
+        if i == 1 then
+            -- First unit near center with optional randomization
+            if enableRandomization then
+                unitX = markerX + (math.random() - 0.5) * 2 * maxRandomOffset
+                unitZ = markerZ + (math.random() - 0.5) * 2 * maxRandomOffset
+            else
+                unitX = markerX
+                unitZ = markerZ
+            end
+        else
+            -- Distribute remaining units in a circle with optional randomization
+            local angle = (i - 2) * (2 * math.pi / (#samUnits - 1))
+            local radius = unitSpacing
+            
+            -- Add randomization to angle and radius if enabled
+            if enableRandomization then
+                local angleVariation = (math.random() - 0.5) * 0.5 -- ±14 degrees
+                local radiusVariation = (math.random() - 0.5) * 20 -- ±10 meters
+                angle = angle + angleVariation
+                radius = radius + radiusVariation
+            end
+            
+            unitX = markerX + (radius * math.cos(angle))
+            unitZ = markerZ + (radius * math.sin(angle))
+        end
+        
+        -- Create unit data
+        local unitName = groupName .. "_" .. (samUnit.type:gsub("%s+", "_")) .. "_" .. i
+        local unitHeading = enableRandomHeading and math.random(0, 359) or 0
+        
+        local unitData = {
+            ["type"] = samUnit.type,
+            ["unitId"] = math.random(10000, 99999),
+            ["skill"] = samUnit.skill or "High",
+            ["y"] = unitZ,
+            ["x"] = unitX,
+            ["name"] = unitName,
+            ["heading"] = unitHeading,
+            ["playerCanDrive"] = false,
+        }
+        
+        table.insert(groupData.units, unitData)
+        debugMsg("[SAM] Unit " .. i .. ": " .. samUnit.type .. " at (" .. math.floor(unitX) .. ", " .. math.floor(unitZ) .. ")")
+    end
+
+    -- Spawn the SAM group
+    local spawnSuccess, spawnResult = pcall(coalition.addGroup, country.id.USA, Group.Category.GROUND, groupData)
+    
+    if spawnSuccess then
+        debugMsg("[SUCCESS] SAM group spawned: " .. groupName .. " with " .. #samUnits .. " units", true)
+        return true
+    else
+        debugMsg("[ERROR] Failed to spawn SAM group: " .. tostring(spawnResult), true)
+        return false
+    end
+end
+
 -- Function to handle "make" commands - spawn vehicle and despawn nearby crates
 local function handleMakeCommand(marker, vehicleType, makeAll)
     makeAll = makeAll or false  -- Default to false if not provided
@@ -619,6 +801,10 @@ local function handleMakeCommand(marker, vehicleType, makeAll)
             debugMsg("[SPAWN] Unit ID: " .. staticData.unitId)
 
             spawnSuccess, spawnResult = pcall(coalition.addStaticObject, country.id.USA, staticData)
+        elseif cargoConfig.category == "SAM_UNITS" then
+            -- Spawn SAM group with multiple units and randomized positioning
+            spawnSuccess = spawnSAMGroup(vehicleType, itemName, unitPosX, unitPosZ)
+            spawnResult = "SAM group spawned"
         else
             -- Spawn vehicle group
             local vehicleGroupName = "Made_" .. vehicleType .. "_Group_" .. itemCounter
@@ -783,7 +969,9 @@ local function scanForMakeCommands()
 
                 -- Map marker text to CONFIG cargo types
                 local makeAll = false
-                if vehicleTypeText == "TANK" or vehicleTypeText == "TANKS" then
+                if vehicleTypeText == "SUPPLYTRUCK" or vehicleTypeText == "SUPPLYTRUCKS" then
+                    vehicleType = "SupplyTruck"
+                elseif vehicleTypeText == "TANK" or vehicleTypeText == "TANKS" then
                     vehicleType = "Tank"
                 elseif vehicleTypeText == "APC" or vehicleTypeText == "APCS" then
                     vehicleType = "APC"
@@ -795,6 +983,13 @@ local function scanForMakeCommands()
                     vehicleType = "MBT"
                 elseif vehicleTypeText == "FARP" or vehicleTypeText == "FARPS" then
                     vehicleType = "FARP"
+                elseif vehicleTypeText == "SRSAM" or vehicleTypeText == "SHORTRANGE" then
+                    vehicleType = "SRSAM"
+                elseif vehicleTypeText == "LRSAM" or vehicleTypeText == "LONGRANGE" then
+                    vehicleType = "LRSAM"
+                elseif vehicleTypeText == "ALL SUPPLYTRUCK" or vehicleTypeText == "ALL SUPPLYTRUCKS" then
+                    vehicleType = "SupplyTruck"
+                    makeAll = true 
                 elseif vehicleTypeText == "ALL TANK" or vehicleTypeText == "ALL TANKS" then
                     vehicleType = "Tank"
                     makeAll = true
