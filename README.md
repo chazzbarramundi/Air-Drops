@@ -8,14 +8,37 @@ This script includes the spawning of c130's, which will carry 2 weapons platform
 If you would like to troubleshoot in the lua script you can turn debuging on which will output messages.
 
 # Instructions
-1. Open the example mission file `Air Drop.miz` in the mission editor.
-3. Click the Set Rules for trigger icon on the left hand nav menu. (3 Down from the text "MIS")
-4. Note the ONCE trigger is set. Click on it.
-5. Note the Time More is set to trigger on load.
-6. Click the DO SCRIPT FILE and make sure it is linked to the Air `Air Drop.lua` script.
-7. Load the mission as a multiplayer mission, then in-game:
-    Use the radio menu to call in drops place map markers named `dp-alpha`, `dp-bravo`, etc. for drop zones (these are generated dynamically) or Spawn CDS cargo containers using the C-130J mod and fly to the drop zone and drop them. Once they have landed use `make tank`, `make apc`, or `make humvee` map markers to spawn vehicles from nearby landed crates. Each spawn requires 2 CDS crates. If you are wanting to build a farp use 4 CDS containers and the map command `make farp`
-8. Enjoy.
+
+## Setup
+1. Place the `Air Drop.lua` script in your mission's MISSION SCRIPTS folder
+2. Load the script in the mission editor using the "Do Script" action
+
+Alternatively:
+1. Open the example mission file `Air Drop.miz` in the mission editor
+2. Click the Set Rules for trigger icon on the left hand nav menu (3 Down from the text "MIS")
+3. Note the ONCE trigger is set. Click on it
+4. Note the Time More is set to trigger on load
+5. Click the DO SCRIPT FILE and make sure it is linked to the `Air Drop.lua` script
+
+## Usage
+
+### Radio Menu Air Drops
+- Use the radio menu to call in drops (costs CMD points if Player Tracker system is loaded)
+- Place map markers named `dp-alpha`, `dp-bravo`, etc. for drop zones (these are generated dynamically)
+
+### Manual C-130J Drops
+- Spawn cargo containers using the C-130J mod (or any static object with the correct name pattern) 
+- Fly and drop them from the C-130J
+- Use "make tank", "make apc", or "make humvee" map markers to spawn vehicles from nearby landed crates
+
+### CMD Point Costs (if Player Tracker available)
+- 2 units (1 C-130): 20 CMD points
+- 4 units (2 C-130s): 40 CMD points  
+- 6 units (3 C-130s): 60 CMD points
+- 8 units (4 C-130s): 80 CMD points
+
+### Manufacturing Requirements
+Each spawn requires 2 CDS crates. If you are wanting to build a FARP use 4 CDS containers and the map command `make farp`.
 
 ![DCS Airdrop Script for Eagle Dynamics Digital Combat Simulator.](/assets/images/cds.png)
 ![DCS Airdrop Script for Eagle Dynamics Digital Combat Simulator.](/assets/images/cds2.png)

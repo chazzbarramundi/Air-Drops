@@ -3,19 +3,7 @@
 -- Description: This script adds Air Drop radio commands that will spawn C-130's and deliver units to a designated
 --              map marker to drop cargo. You can also spawn and track the c130 supply containers dropped by players and use 
 --              them as "materials" to "manufacture" vehicles at the drop zone using the map marker "make {{unit}}" command.
-
--- To use this script:
--- 1. Place it in your mission's MISSION SCRIPTS folder
--- 2. Load the script in the mission editor using the "Do Script" action
-
--- then in-game:
--- Use the radio menu to call in drops
--- Place map markers named "dp-alpha", "dp-bravo", etc. for drop zones (these are generated dynamically)
--- or
--- Spawn cargo containers using the C-130J mod (or any static object with the correct name pattern) and fly and drop them from the c130j
--- then use "make tank", "make apc", or "make humvee" map markers to spawn vehicles from nearby landed crates.
-
--- 5. Get good.
+--              Integrates with Player Tracker system for CMD point costs if available.
 
 
 -- =====================================================================================
@@ -23,8 +11,8 @@
 -- =====================================================================================
 
 local CONFIG = {
-    debug = true,  -- Set to false to disable debug messages
-    production_mode = false,  -- Set to true to reduce overhead and debug output
+    debug = false,  -- Set to false to disable debug messages
+    production_mode = true,  -- Set to true to reduce overhead and debug output
 
     -- Enable features    enable_air_drops = true,  -- Set to false to disable all air drop functionality
     enable_make_command = true,  -- Set to false to disable the "make" command
@@ -139,17 +127,118 @@ local CONFIG = {
 
 }
 
-
 -- =====================================================================================
 -- DEBUG FUNCTIONS
 -- =====================================================================================
 
--- Debug function that outputs to both log and players if debug is enabled
+--- Outputs debug messages to both DCS log and player screens.
+-- @param message The debug message to display
+-- @param force (optional) Force display even in production mode
+-- @return void
 local function debugMsg(message, force)
     env.info("[Air Drop] " .. message)
     if (CONFIG.debug and not CONFIG.production_mode) or force then
         trigger.action.outText(message, 10)
     end
+end
+
+--- Internal helper to display messages to specific group.
+-- @param parameters Table containing groupID, ptext, pduration, pclear
+-- @return void
+local function showMessageForGroup(parameters)
+	trigger.action.outTextForGroup(parameters.groupID, parameters.ptext, parameters.pduration, parameters.pclear)
+end
+
+--- Finds a player's group ID by their player name.
+-- @param playerName The name of the player to search for
+-- @return number|nil The group ID if found, nil otherwise
+local function getPlayerGroupIDByName(playerName)
+    if not playerName then
+        return nil
+    end
+    
+    local coalitions = {coalition.side.BLUE, coalition.side.RED, coalition.side.NEUTRAL}
+    local categories = {Group.Category.AIRPLANE, Group.Category.GROUND, Group.Category.SHIP, Group.Category.HELICOPTER}
+    
+    for _, side in pairs(coalitions) do
+        for _, category in pairs(categories) do
+            local groups = coalition.getGroups(side, category)
+            if groups then
+                for _, group in pairs(groups) do
+                    if group and group:isExist() then
+                        local units = group:getUnits()
+                        if units then
+                            for _, unit in pairs(units) do
+                                if unit and unit:isExist() then
+                                    local unitPlayerName = unit:getPlayerName()
+                                    if unitPlayerName == playerName then
+                                        return group:getID()
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return nil
+end
+
+--- Enhanced message function that can target specific players or broadcast to all.
+-- @param text The message text to display
+-- @param duration (optional) How long to show the message (seconds)
+-- @param delaySec (optional) Delay before showing message (seconds)
+-- @param clear (optional) Whether to clear existing messages
+-- @param groupID (optional) Specific group ID to target
+-- @param playerName (optional) Specific player name to target
+-- @return void
+local function setMsg(text, duration, delaySec, clear, groupID, playerName)
+    
+    -- If groupID is not provided, try to determine target
+    if not groupID then
+        if playerName then
+            -- Try to find specific player's group
+            groupID = getPlayerGroupIDByName(playerName)
+        end
+        
+        -- If still no specific target, send to all players
+        if not groupID then
+            debugMsg("No specific player target, sending message to all players: " .. text)
+            trigger.action.outText(text, duration or 10)
+            return
+        end
+    end
+    
+	if clear == nil or clear == false then
+        clear = false
+	else
+		clear = true
+    end
+    
+    -- Use minimum delay of 0.1 seconds instead of 0 for timer reliability
+    local actualDelay = math.max(delaySec or 0, 0.1)
+	timer.scheduleFunction(showMessageForGroup, {groupID = groupID, ptext = text, pduration = duration or 10, pclear = clear}, timer.getTime() + actualDelay)
+end
+
+--- Broadcasts a message to all players in the mission.
+-- @param text The message text to display
+-- @param duration (optional) How long to show the message (seconds)
+-- @param delaySec (optional) Delay before showing message (seconds)
+-- @param clear (optional) Whether to clear existing messages
+-- @return void
+local function setMsgToAll(text, duration, delaySec, clear)
+    if clear == nil or clear == false then
+        clear = false
+    else
+        clear = true
+    end
+    
+    local actualDelay = math.max(delaySec or 0, 0.1)
+    timer.scheduleFunction(function()
+        trigger.action.outText(text, duration or 10)
+    end, nil, timer.getTime() + actualDelay)
 end
 
 
@@ -160,26 +249,53 @@ end
 local AirDropState = {
     initialized = false,
     groupCounter = 0,
-    makeCounter = 0,           -- Counter for manufactured vehicles
-    playerCrates = {},         -- Track dropped cargo crates from players: [unitName] = { unit, spawnTime, been_airborne }
-    spawnedGroups = {},        -- Track all spawned aircraft groups: [groupName] = { group, spawnTime }
-    activeDrops = {},          -- Track active drop missions: [groupName] = { markerName, vehicleType, qty, status, spawnTime }
-    pendingDropRequests = {},  -- Store pending drop requests waiting for markers: [markerLabel] = { vehicleType, qty, requestTime }
+    makeCounter = 0,            -- Counter for manufactured vehicles
+    playerCrates = {},          -- Track dropped cargo crates from players: [unitName] = { unit, spawnTime, been_airborne }
+    spawnedGroups = {},         -- Track all spawned aircraft groups: [groupName] = { group, spawnTime }
+    activeDrops = {},           -- Track active drop missions: [groupName] = { markerName, vehicleType, qty, status, spawnTime }
+    pendingDropRequests = {},   -- Store pending drop requests waiting for markers: [markerLabel] = { vehicleType, qty, requestTime }
 }
 
+local airDropMenus = {}         -- [groupID] = mainMenuHandle
+
+-- =====================================================================================
+-- EXTERNAL STATE MANAGEMENT
+-- =====================================================================================
+
+--- Checks if the Player Tracker CMD system is available and enabled.
+-- @return boolean True if CMD system is available, false otherwise
+local function isCMDEnabled()
+    if PlayerTrackerInstance then
+        return true
+    end
+    return false
+end
+
+--- Checks if a player has enough CMD points for a purchase.
+-- @param playerName The name of the player to check
+-- @param cost The CMD point cost to verify
+-- @return boolean True if player has enough points, false otherwise
+local function hasEnoughCMDPoints(playerName, cost)
+    if PlayerTrackerInstance and playerName then
+        return PlayerTrackerInstance:getCommandTokens(playerName) >= cost
+    end
+    return true -- Allow if PlayerTracker not available
+end
 
 -- =====================================================================================
 -- PLAYER CRATE FUNCTIONS
 -- =====================================================================================
 
--- Function to check if a static object is a player-spawned container (based on c130_supply.lua)
+--- Determines if a unit is a player-spawned cargo container.
+-- @param unitTypeName The DCS unit type name
+-- @param unitName The unit's instance name
+-- @return boolean True if this is a trackable player crate
 local function isPlayerCrateType(unitTypeName, unitName)
     if not unitName then 
         return false 
     end
     
     -- Check by name patterns (C-130J mod containers use specific patterns)
-    -- Pattern matches based on working c130_supply.lua implementation
     if string.find(unitName, "^iso_container%-") or 
        string.find(unitName, "^iso_container_small%-") or
        string.find(unitName, "^cds_barrels%-") or
@@ -191,35 +307,26 @@ local function isPlayerCrateType(unitTypeName, unitName)
     return false
 end
 
--- Event handler for unit spawning
+--- Processes DCS world events for crate tracking and player detection.
+-- @param event DCS event data containing id, initiator, target, etc.
+-- @return void
 local function onEvent(event)
     -- Safety check: ensure event is valid
     if not event or not event.id then
         return
     end
-    
-    -- Log all events to see what's happening
-    if CONFIG.debug then
-        debugMsg("EVENT: Received event ID: " .. (event.id or "nil") .. " (" .. tostring(event.id) .. ")")
-    end
-    
+
     -- Check for various spawn-related events
     if event.id == world.event.S_EVENT_BIRTH or 
        event.id == world.event.S_EVENT_UNIT_LOST or
        event.id == world.event.S_EVENT_DEAD or
        event.id == world.event.S_EVENT_PLAYER_ENTER_UNIT then
-        
+
         local unit = event.initiator or event.target
-        if unit and type(unit) == "userdata" and unit.isExist and unit:isExist() then
+        if unit and unit:isExist() then
             local unitName = unit:getName()
             local unitTypeName = unit:getTypeName()
-            
-            if event.id == world.event.S_EVENT_BIRTH then
-                debugMsg("EVENT: Unit spawned/born - " .. unitName .. " (type: " .. unitTypeName .. ")")
-            else
-                debugMsg("EVENT: Unit event " .. event.id .. " - " .. unitName .. " (type: " .. unitTypeName .. ")")
-            end
-            
+
             -- Check if this is a crate type and not already tracked (only for birth events)
             if event.id == world.event.S_EVENT_BIRTH and isPlayerCrateType(unitTypeName, unitName) and not AirDropState.playerCrates[unitName] then
                 -- Add to tracking
@@ -231,26 +338,22 @@ local function onEvent(event)
                     typeName = unitTypeName,
                     isStatic = true
                 }
-                
                 debugMsg("✓ Player crate detected via event and added to tracking: " .. unitName .. " (type: " .. unitTypeName .. ")")
-                debugMsg("Player crate detected: " .. unitName .. " (" .. unitTypeName .. ")")
             end
         end
     end
 end
 
--- Function to check if a static object is a player-spawned container (based on c130_supply.lua)
--- Debug function to show all current objects (now including static objects correctly)
+--- Debug utility that displays all objects in the mission for troubleshooting.
+-- @return void
 local function debugShowAllObjects()
     debugMsg("========== DEBUGGING: Showing all objects in mission ==========")
-    
+
     local coalitions = {coalition.side.BLUE, coalition.side.RED, coalition.side.NEUTRAL}
     local totalObjects = 0
     local potentialContainers = 0
-    
+
     for _, side in pairs(coalitions) do
-        debugMsg("Checking coalition " .. side .. ":")
-        
         -- Check ground groups
         local groups = coalition.getGroups(side, Group.Category.GROUND)
         if groups then
@@ -301,7 +404,9 @@ local function debugShowAllObjects()
     debugMsg("Debug complete - found " .. totalObjects .. " objects (" .. potentialContainers .. " potential containers). Check log for details.")
 end
 
--- Debug function to search for objects by partial name match
+--- Debug function to search for objects by partial name match.
+-- @param searchPattern Text pattern to search for in object names
+-- @return void
 local function debugSearchObjects(searchPattern)
     debugMsg("========== DEBUGGING: Searching for objects matching '" .. searchPattern .. "' ==========")
     
@@ -362,7 +467,8 @@ local function debugSearchObjects(searchPattern)
     debugMsg("Found " .. foundObjects .. " objects matching '" .. searchPattern .. "'. Check log for details.")
 end
 
--- Debug function to show currently tracked containers
+--- Debug function to show currently tracked containers.
+-- @return void
 local function debugShowTrackedContainers()
     debugMsg("========== DEBUGGING: Currently tracked containers ==========")
     
@@ -382,7 +488,8 @@ local function debugShowTrackedContainers()
     debugMsg("Currently tracking " .. trackedCount .. " containers. Check log for details.")
 end
 
--- Consolidated function to scan for containers and monitor status in one pass
+--- Consolidated function to scan for containers and monitor status in one pass.
+-- @return void
 local function scanAndMonitorPlayerCrates()
     local foundContainers = 0
     local newContainers = 0
@@ -484,10 +591,6 @@ local function scanAndMonitorPlayerCrates()
                     local finalBeenAirborne = isTestCrate and true or (not isOnGround)
                     local finalIsOnGround = isTestCrate and true or isOnGround
                     
-                    if isTestCrate then
-                        debugMsg("TEST CRATE DETECTED: " .. objName .. " - auto-configuring as airborne+landed for immediate use")
-                    end
-
                     AirDropState.playerCrates[objName] = {
                         unit = staticObj,
                         spawnTime = currentTime,
@@ -500,11 +603,6 @@ local function scanAndMonitorPlayerCrates()
                     }
 
                     newContainers = newContainers + 1
-                    if not CONFIG.production_mode then
-                        local groundStatus = finalIsOnGround and "ON GROUND" or "AIRBORNE"
-                        local testStatus = isTestCrate and " [TEST CRATE - PRE-LANDED]" or ""
-                        debugMsg("NEW C-130J container detected: " .. objName .. " [" .. containerType .. "] (" .. staticData.coalition .. ") - " .. groundStatus .. testStatus)
-                    end
                 end
             end
         end
@@ -517,10 +615,40 @@ local function scanAndMonitorPlayerCrates()
 end
 
 -- =====================================================================================
+-- COMMAND POINT FUNCTIONS  
+-- =====================================================================================
+
+--- Deducts CMD points from a player's account if Player Tracker is available.
+-- @param playerName The name of the player to charge
+-- @param cost The number of CMD points to deduct
+-- @return boolean True if successful or no CMD system, false if insufficient funds
+local function spendCMDPoints(playerName, cost)
+    if PlayerTrackerInstance then
+        local success = PlayerTrackerInstance:deductCommandTokens(playerName, cost)
+        if success then
+           debugMsg("Player " .. playerName .. " spent " .. cost .. " command tokens. Remaining: " .. PlayerTrackerInstance:getCommandTokens(playerName))
+            return true
+        else
+            debugMsg("Player " .. playerName .. " does not have enough command tokens.")
+            return false
+        end
+    else
+        -- PlayerTrackerInstance doesn't exist, allow operation without cost
+        debugMsg("PlayerTracker not available - allowing operation without command token cost")
+        return true
+    end
+end
+
+-- =====================================================================================
 -- AIR DROP FUNCTIONS
 -- =====================================================================================
 
--- Function to spawn SAM group with randomized positioning (based on REINFORCED script)
+--- Spawns SAM groups with randomized positioning (based on REINFORCED script)
+-- @param samType (string) Type of SAM system to spawn
+-- @param groupBaseName (string) Base name for the SAM group
+-- @param markerX (number) X coordinate for spawn location
+-- @param markerZ (number) Z coordinate for spawn location
+-- @return void
 local function spawnSAMGroup(samType, groupBaseName, markerX, markerZ)
     debugMsg("[SAM] ================ SAM GROUP SPAWNING =================")
     debugMsg("[SAM] SAM Type: " .. tostring(samType))
@@ -650,7 +778,11 @@ local function spawnSAMGroup(samType, groupBaseName, markerX, markerZ)
     end
 end
 
--- Function to handle "make" commands - spawn vehicle and despawn nearby crates
+--- Handles "make" commands to spawn vehicles and consume nearby crates.
+-- @param marker Map marker data containing position and text
+-- @param vehicleType Type of vehicle to manufacture
+-- @param makeAll Whether to make all possible units or just one
+-- @return void
 local function handleMakeCommand(marker, vehicleType, makeAll)
     makeAll = makeAll or false  -- Default to false if not provided
     debugMsg("[MAKE] ================ MAKE COMMAND HANDLER =================")
@@ -732,7 +864,7 @@ local function handleMakeCommand(marker, vehicleType, makeAll)
     
     if #nearbyCrates < requiredCrates then
         debugMsg("[ERROR] Insufficient materials for " .. cargoConfig.name .. " - need " .. requiredCrates .. " landed crates, found " .. #nearbyCrates)
-        debugMsg("[ERROR] MANUFACTURING FAILED: Need " .. requiredCrates .. " landed containers near marker to build " .. cargoConfig.name)
+        setMsgToAll("Unable to build you need " .. requiredCrates .. " landed containers of the right type near marker to build " .. cargoConfig.name, 10, 0, false)
 
         -- Remove the make command marker since we can't fulfill it
         debugMsg("[CLEANUP] Removing unfulfillable make command marker ID: " .. marker.idx)
@@ -882,7 +1014,7 @@ local function handleMakeCommand(marker, vehicleType, makeAll)
     
     if spawnedUnits > 0 then
         local unitText = spawnedUnits == 1 and cargoConfig.name or cargoConfig.name .. "s"
-        debugMsg("[MAKE] " .. spawnedUnits .. " " .. unitText .. " manufactured from " .. cratesToUse .. " containers!", true)
+        setMsg("Deploying " .. spawnedUnits .. "x " .. unitText .. " manufactured from " .. cratesToUse .. " containers!", 10 , 0, true)
 
         -- Despawn the selected crates used as materials
         local despawnedCount = 0
@@ -912,13 +1044,13 @@ local function handleMakeCommand(marker, vehicleType, makeAll)
     else
         debugMsg("[ERROR] Failed to spawn any " .. cargoConfig.name .. "s - all spawn attempts failed")
     end
-
     debugMsg("[MAKE] ================ MAKE COMMAND COMPLETE =================")
 end
 
--- Function to find map marker by name and handle special "make" commands
+--- Finds a map marker by name for drop zone targeting.
+-- @param markerName Name of the marker to search for
+-- @return table|nil Marker data if found, nil otherwise
 local function getMapMarker(markerName)
-    debugMsg("Searching for map marker: " .. markerName)
 
     -- Get all markers from the mission
     local markers = world.getMarkPanels()
@@ -931,17 +1063,12 @@ local function getMapMarker(markerName)
             return _mark
         end
     end
-
-    debugMsg("WARNING: No map marker found with name '" .. markerName .. "'")
-    debugMsg("WARNING: No marker found! Please create a map marker named '" .. markerName .. "'")
     return nil
 end
 
--- Function to scan for and process make command markers
+--- Scans for and processes make command markers on the map.
+-- @return void
 local function scanForMakeCommands()
-    if not CONFIG.production_mode then
-        debugMsg("[SCAN] Scanning for make command markers...")
-    end
 
     local markers = world.getMarkPanels()
     if not markers then
@@ -1023,13 +1150,14 @@ local function scanForMakeCommands()
     end
 
     if foundMakeCommands == 0 and not CONFIG.production_mode then
-        debugMsg("[INFO] No make command markers found during scan")
+        -- debugMsg("[INFO] No make command markers found during scan")
     elseif foundMakeCommands > 0 then
         debugMsg("[COMPLETE] Processed " .. foundMakeCommands .. " make command markers")
     end
 end
 
--- output all world markers for debugging
+--- Output all world markers for debugging purposes.
+-- @return void
 local function outputAllMapMarkers()
     debugMsg("Listing all world map markers:")
     
@@ -1046,7 +1174,9 @@ local function outputAllMapMarkers()
     end
 end
 
--- find the nearest airport to a given position
+--- Find the nearest airport to a given position.
+-- @param position Position table with x, y, z coordinates
+-- @return table|nil Nearest airport data or nil if none found
 local function getNearestAirport(position)
     debugMsg("Searching for nearest airport to drop zone...")
     
@@ -1089,7 +1219,10 @@ local function getNearestAirport(position)
     end
 end
 
--- Function to calculate heading between two points
+--- Function to calculate heading between two points.
+-- @param from Starting position table
+-- @param to Target position table  
+-- @return number Heading in degrees
 local function getHeading(from, to)
     local dx = to.pos.x - from.x
     local dz = to.pos.z - from.z
@@ -1097,7 +1230,8 @@ local function getHeading(from, to)
     return angle
 end
 
--- Function to clean up old groups
+--- Function to clean up old groups
+-- @return void
 local function cleanupOldGroups()
     local currentTime = timer.getTime()
     for groupName, groupData in pairs(AirDropState.spawnedGroups) do
@@ -1113,8 +1247,13 @@ local function cleanupOldGroups()
     end
 end
 
--- Function to spawn C-130 and fly to drop zone
-local function spawnDropAircraft(vehicleType, qty)
+--- Spawns C-130 aircraft and flies to drop zone with cargo.
+-- @param vehicleType Type of vehicle to drop (Tank, APC, Humvee, etc.)
+-- @param qty Quantity of vehicles to drop
+-- @param playerName Name of the requesting player
+-- @return boolean Success status of the spawn operation
+-- @usage spawnDropAircraft("Tank", 2, "Pilot123")
+local function spawnDropAircraft(vehicleType, qty, playerName)
     vehicleType = vehicleType or "Tank"  -- Default to Tank if not specified
     qty = qty or 2  -- Default to 2 if not specified (minimum drop)
 
@@ -1132,8 +1271,6 @@ local function spawnDropAircraft(vehicleType, qty)
 
     -- Calculate number of aircraft needed (each C-130 carries 2 units)
     local aircraftQty = qty / 2
-
-    debugMsg("========== Starting Air Drop Mission: " .. qty .. " x " .. cargoConfig.name .. " (" .. aircraftQty .. " aircraft) ==========")
 
     -- Generate a unique marker label that isn't already in use
     local phoneticAlphabet = {"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango"}
@@ -1187,18 +1324,46 @@ local function spawnDropAircraft(vehicleType, qty)
         qty = qty,
         aircraftQty = aircraftQty,
         cargoConfig = cargoConfig,
-        requestTime = timer.getTime()
+        requestTime = timer.getTime(),
+        playerName = playerName  -- Store the requesting player
     }
 
-    -- output the marker so the user can use it.
-    debugMsg("Drop requested: " .. qty .. " " .. cargoConfig.name .. "s (" .. aircraftQty .. " C-130s). Create marker: " .. markerLabel)
-    debugMsg("Waiting for user to place marker: " .. markerLabel)
+    -- Send marker instruction to the requesting player (or all if no specific player)
+    setMsg("Place marker: " .. markerLabel .. " at the desired drop location to dispatch the aircraft.", 10, 0, false, nil, playerName)
 
     return true
 end
 
--- Internal function to execute the actual aircraft spawn once marker is found
-local function executeAircraftSpawn(dropMarker, vehicleType, qty, markerName)
+--- Internal function to execute the actual aircraft spawn once marker is found.
+-- Handles CMD point validation, aircraft spawning, and waypoint setup
+-- @param dropMarker Map marker for drop location
+-- @param vehicleType Type of vehicle to drop
+-- @param qty Quantity of vehicles to drop
+-- @param markerName Name of the marker to search for
+-- @param playerName Name of the requesting player
+-- @return boolean Success status of the spawn operation
+local function executeAircraftSpawn(dropMarker, vehicleType, qty, markerName, playerName)
+
+    local usingCMD = isCMDEnabled()
+
+    if usingCMD then
+        if not playerName then
+            debugMsg("ERROR: Could not determine player name for CMD points deduction")
+            setMsgToAll("Error: Could not determine player for command point deduction", 5, 1, true)
+            return false
+        end
+
+        local requiredPoints = qty * 10  -- Example: 10 points per unit, adjust as needed
+        if not hasEnoughCMDPoints(playerName, requiredPoints) then
+            debugMsg("ERROR: Player '" .. playerName .. "' does not have enough CMD points to spawn " .. qty .. " units of " .. vehicleType)
+            setMsg("Not enough CMD points to spawn " .. vehicleType .. ". Required: " .. requiredPoints, 5, 1, true, nil, playerName)
+            return false
+        end
+        
+        -- Spend the command points
+        spendCMDPoints(playerName, requiredPoints)
+    end
+
     local cargoConfig = CONFIG.cargo_types[vehicleType]
     
     -- Calculate number of aircraft needed (each C-130 carries 2 units)
@@ -1586,73 +1751,175 @@ local function executeAircraftSpawn(dropMarker, vehicleType, qty, markerName)
     end
 end
 
+--- Process a pending drop request when marker is found.
+-- Retrieves stored request data and executes aircraft spawn with player context
+-- @param markerLabel The marker label to look up in pending requests
+-- @param dropMarker Map marker object containing position and text
+-- @return boolean True if request was processed successfully, false if not found
+local function processPendingDropRequest(markerLabel, dropMarker)
+    local request = AirDropState.pendingDropRequests[markerLabel]
+    if not request then
+        return false
+    end
+    
+    -- Remove from pending requests
+    AirDropState.pendingDropRequests[markerLabel] = nil
+    
+    -- Execute the aircraft spawn with the stored player context
+    return executeAircraftSpawn(dropMarker, request.vehicleType, request.qty, markerLabel, request.playerName)
+end
+
+-- =====================================================================================
+-- DYNAMIC RADIO MENU MANAGEMENT
+-- =====================================================================================
+
+--- Creates player-specific radio menus for air drop requests.
+-- Uses JTAC-style menu management with proper cleanup
+-- @param groupID The group ID for menu targeting
+-- @param playerName Name of the player for the menu
+-- @return void
+local function createPlayerSpecificMenu(groupID, playerName)
+    if not CONFIG.enable_npc_drops then
+        return
+    end
+    
+    -- Remove existing menu if it exists (like JTAC does)
+    if airDropMenus[groupID] then
+        missionCommands.removeItemForGroup(groupID, airDropMenus[groupID])
+    end
+    
+    debugMsg("Creating radio menu for group ID: " .. groupID)
+    
+    -- Create main menu for this specific player group
+    local mainMenu = missionCommands.addSubMenuForGroup(groupID, "Call Air Drop")
+
+    -- Add submenu for different vehicle types for this player group
+    local tankMenu = missionCommands.addSubMenuForGroup(groupID, "Drop Tanks", mainMenu)
+    local apcMenu = missionCommands.addSubMenuForGroup(groupID, "Drop APCs", mainMenu)
+    local humveeMenu = missionCommands.addSubMenuForGroup(groupID, "Drop Humvees", mainMenu)
+
+    local usingCMD = isCMDEnabled()
+
+    -- Tank quantity menus
+    local tank1Text = usingCMD and "1 C-130 (2 Tanks) [CMD 10]" or "1 C-130 (2 Tanks)"
+    local tank2Text = usingCMD and "2 C-130s (4 Tanks) [CMD 20]" or "2 C-130s (4 Tanks)"
+    local tank3Text = usingCMD and "3 C-130s (6 Tanks) [CMD 30]" or "3 C-130s (6 Tanks)"
+    local tank4Text = usingCMD and "4 C-130s (8 Tanks) [CMD 40]" or "4 C-130s (8 Tanks)"
+    
+    local tank1Menu = missionCommands.addSubMenuForGroup(groupID, tank1Text, tankMenu)
+    local tank2Menu = missionCommands.addSubMenuForGroup(groupID, tank2Text, tankMenu)
+    local tank3Menu = missionCommands.addSubMenuForGroup(groupID, tank3Text, tankMenu)
+    local tank4Menu = missionCommands.addSubMenuForGroup(groupID, tank4Text, tankMenu)
+
+    -- APC quantity menus
+    local apc1Text = usingCMD and "1 C-130 (2 APCs) [CMD 10]" or "1 C-130 (2 APCs)" 
+    local apc2Text = usingCMD and "2 C-130s (4 APCs) [CMD 20]" or "2 C-130s (4 APCs)"
+    local apc3Text = usingCMD and "3 C-130s (6 APCs) [CMD 30]" or "3 C-130s (6 APCs)"
+    local apc4Text = usingCMD and "4 C-130s (8 APCs) [CMD 40]" or "4 C-130s (8 APCs)"
+    
+    local apc1Menu = missionCommands.addSubMenuForGroup(groupID, apc1Text, apcMenu)
+    local apc2Menu = missionCommands.addSubMenuForGroup(groupID, apc2Text, apcMenu)
+    local apc3Menu = missionCommands.addSubMenuForGroup(groupID, apc3Text, apcMenu)
+    local apc4Menu = missionCommands.addSubMenuForGroup(groupID, apc4Text, apcMenu)
+
+    -- Humvee quantity menus
+    local humvee1Text = usingCMD and "1 C-130 (2 Humvees) [CMD 10]" or "1 C-130 (2 Humvees)"
+    local humvee2Text = usingCMD and "2 C-130s (4 Humvees) [CMD 20]" or "2 C-130s (4 Humvees)"
+    local humvee3Text = usingCMD and "3 C-130s (6 Humvees) [CMD 30]" or "3 C-130s (6 Humvees)"
+    local humvee4Text = usingCMD and "4 C-130s (8 Humvees) [CMD 40]" or "4 C-130s (8 Humvees)"
+    
+    local humvee1Menu = missionCommands.addSubMenuForGroup(groupID, humvee1Text, humveeMenu)
+    local humvee2Menu = missionCommands.addSubMenuForGroup(groupID, humvee2Text, humveeMenu)
+    local humvee3Menu = missionCommands.addSubMenuForGroup(groupID, humvee3Text, humveeMenu)
+    local humvee4Menu = missionCommands.addSubMenuForGroup(groupID, humvee4Text, humveeMenu)
+
+    -- Add commands with player context
+    missionCommands.addCommandForGroup(groupID, "Request Drop", tank1Menu, 
+        function() spawnDropAircraft("Tank", 2, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", tank2Menu, 
+        function() spawnDropAircraft("Tank", 4, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", tank3Menu, 
+        function() spawnDropAircraft("Tank", 6, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", tank4Menu, 
+        function() spawnDropAircraft("Tank", 8, playerName) end)
+
+    missionCommands.addCommandForGroup(groupID, "Request Drop", apc1Menu, 
+        function() spawnDropAircraft("APC", 2, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", apc2Menu, 
+        function() spawnDropAircraft("APC", 4, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", apc3Menu, 
+        function() spawnDropAircraft("APC", 6, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", apc4Menu, 
+        function() spawnDropAircraft("APC", 8, playerName) end)
+
+    missionCommands.addCommandForGroup(groupID, "Request Drop", humvee1Menu, 
+        function() spawnDropAircraft("Humvee", 2, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", humvee2Menu, 
+        function() spawnDropAircraft("Humvee", 4, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", humvee3Menu, 
+        function() spawnDropAircraft("Humvee", 6, playerName) end)
+    missionCommands.addCommandForGroup(groupID, "Request Drop", humvee4Menu, 
+        function() spawnDropAircraft("Humvee", 8, playerName) end)
+    
+    debugMsg("✓ Radio menu created for group ID: " .. groupID)
+    
+    -- Store menu handle (simplified like JTAC)
+    airDropMenus[groupID] = mainMenu
+end
+
+-- =====================================================================================
+-- EVENT HANDLER
+-- =====================================================================================
+
+-- Air Drop event handler table
+local airDropEventHandler = {}
+
+--- Event handler function for DCS world events.
+-- Handles player enter/leave events to manage radio menus
+-- @param self The event handler object
+-- @param event DCS event data
+-- @return void
+airDropEventHandler.onEvent = function(self, event)
+    -- Handle player entering unit events to create radio menus
+    if (world.event.S_EVENT_PLAYER_ENTER_UNIT == event.id) and event.initiator then
+        local playerName = event.initiator:getPlayerName()
+        if playerName and playerName ~= "" then
+            local groupID = event.initiator:getGroup():getID()
+            local groupName = event.initiator:getGroup():getName()
+            
+            debugMsg("Player entered unit: " .. playerName .. " (Group: " .. groupName .. ", ID: " .. groupID .. ")")
+            
+            if CONFIG.enable_npc_drops then
+                createPlayerSpecificMenu(groupID, playerName)
+                debugMsg("Radio menu created/updated for player: " .. playerName)
+            end
+        end
+    end
+    
+    -- Handle player leave events to clean up menu tracking
+    if (world.event.S_EVENT_PLAYER_LEAVE_UNIT == event.id) and event.initiator then
+        local groupID = event.initiator:getGroup():getID()
+        
+        -- Remove menu when player leaves
+        if airDropMenus[groupID] then
+            missionCommands.removeItemForGroup(groupID, airDropMenus[groupID])
+            airDropMenus[groupID] = nil
+            debugMsg("Removed menu for group " .. groupID .. " (player left)")
+        end
+    end
+    
+    -- Handle existing unit spawning events for crate detection
+    if event.id == world.event.S_EVENT_BIRTH then
+        onEvent(event)
+    end
+end
 
 -- =====================================================================================
 -- RADIO FUNCTIONS
 -- =====================================================================================
 
+-- Radio menu creation function - Creates debug menus only, player menus created on birth events
 local function createRadioMenu()
-
-    if CONFIG.enable_npc_drops == true then
-        -- Create main menu for Blue coalition
-        local mainMenu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "Call Air Drop")
-
-
-        -- Add submenu for different vehicle types
-        local tankMenu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "Drop Tanks", mainMenu)
-        local apcMenu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "Drop APCs", mainMenu)
-        local humveeMenu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "Drop Humvees", mainMenu)
-
-        -- Create quantity submenus for each vehicle type
-
-        -- Tank quantity menus (each C-130 carries 2 tanks)
-        local tank1Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "1 C-130 (2 Tanks)", tankMenu)
-        local tank2Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "2 C-130s (4 Tanks)", tankMenu)
-        local tank3Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "3 C-130s (6 Tanks)", tankMenu)
-        local tank4Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "4 C-130s (8 Tanks)", tankMenu)
-
-        -- APC quantity menus (each C-130 carries 2 APCs)
-        local apc1Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "1 C-130 (2 APCs)", apcMenu)
-        local apc2Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "2 C-130s (4 APCs)", apcMenu)
-        local apc3Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "3 C-130s (6 APCs)", apcMenu)
-        local apc4Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "4 C-130s (8 APCs)", apcMenu)
-
-        -- Humvee quantity menus (each C-130 carries 2 Humvees)
-        local humvee1Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "1 C-130 (2 Humvees)", humveeMenu)
-        local humvee2Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "2 C-130s (4 Humvees)", humveeMenu)
-        local humvee3Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "3 C-130s (6 Humvees)", humveeMenu)
-        local humvee4Menu = missionCommands.addSubMenuForCoalition(coalition.side.BLUE, "4 C-130s (8 Humvees)", humveeMenu)
-
-        -- Add commands for Tank drops (qty represents total tanks to deliver)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", tank1Menu, 
-            function() spawnDropAircraft("Tank", 2) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", tank2Menu, 
-            function() spawnDropAircraft("Tank", 4) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", tank3Menu, 
-            function() spawnDropAircraft("Tank", 6) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", tank4Menu, 
-            function() spawnDropAircraft("Tank", 8) end)
-
-        -- Add commands for APC drops (qty represents total APCs to deliver)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", apc1Menu, 
-            function() spawnDropAircraft("APC", 2) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", apc2Menu, 
-            function() spawnDropAircraft("APC", 4) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", apc3Menu, 
-            function() spawnDropAircraft("APC", 6) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", apc4Menu, 
-            function() spawnDropAircraft("APC", 8) end)
-
-        -- Add commands for Humvee drops (qty represents total Humvees to deliver)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", humvee1Menu, 
-            function() spawnDropAircraft("Humvee", 2) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", humvee2Menu, 
-            function() spawnDropAircraft("Humvee", 4) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", humvee3Menu, 
-            function() spawnDropAircraft("Humvee", 6) end)
-        missionCommands.addCommandForCoalition(coalition.side.BLUE, "Request Drop", humvee4Menu, 
-            function() spawnDropAircraft("Humvee", 8) end)
-    end
     -- Add debug commands to the main menu for troubleshooting
     if CONFIG.debug == true then
         debugMsg("Adding debug commands to radio menu")
@@ -1672,11 +1939,9 @@ local function createRadioMenu()
         missionCommands.addCommandForCoalition(coalition.side.BLUE, "DEBUG: Test Make Commands", c130Menu, 
             function() scanForMakeCommands() end)
 
-        debugMsg("Radio menu created with vehicle and quantity options - 'Call Air Drop' menu available")
+        debugMsg("Debug radio menu created - Player menus will be created on spawn events")
     end
-
 end
-
 
 -- =====================================================================================
 -- MARKER MONITORING SYSTEM
@@ -1687,16 +1952,19 @@ local function masterMonitor()
     -- Check pending drop requests
     for markerLabel, requestData in pairs(AirDropState.pendingDropRequests) do
         local dropMarker = getMapMarker(markerLabel)
-        
+
         if dropMarker then
             debugMsg("[SUCCESS] Marker found for pending drop: " .. markerLabel)
-            debugMsg("Drop marker detected! Spawning C-130s to " .. markerLabel, true)
             
-            -- Execute the aircraft spawn, passing the markerName
-            executeAircraftSpawn(dropMarker, requestData.vehicleType, requestData.qty, markerLabel)
-            
-            -- Remove this request from pending list
-            AirDropState.pendingDropRequests[markerLabel] = nil
+            -- Send confirmation to the requesting player (if available) or all players
+            if requestData.playerName then
+                setMsg("Coordinates received. Sending C-130s to " .. markerLabel, 10, 0, false, nil, requestData.playerName)
+            else
+                setMsgToAll("Coordinates received. Sending C-130s to " .. markerLabel, 10, 0, false)
+            end
+
+            -- Execute the aircraft spawn using the enhanced function with player context
+            processPendingDropRequest(markerLabel, dropMarker)
         else
             -- Check if request has timed out (5 minutes)
             local requestAge = timer.getTime() - requestData.requestTime
@@ -1711,6 +1979,8 @@ local function masterMonitor()
     if CONFIG.enable_make_command then
         scanForMakeCommands()
     end
+    
+    -- Note: Radio menu refresh removed - menus now created on birth events
     
     -- Continue monitoring
     return timer.getTime() + CONFIG.scan_frequency
@@ -1729,43 +1999,39 @@ local function initialize()
 
     -- Create radio menu after a short delay
     timer.scheduleFunction(createRadioMenu, {}, timer.getTime() + 2)
-    
-    -- Register event handler for unit spawning
-    local eventHandler = {}
-    eventHandler.onEvent = function(self, event)
-        onEvent(event)
-    end
-    world.addEventHandler(eventHandler)
-    debugMsg("Event handler registered for crate spawn detection")
-    
+
+    -- Register event handler for birth events and unit spawning
+    world.addEventHandler(airDropEventHandler)
+    debugMsg("Event handler registered for birth events and crate spawn detection")
+
     -- Start the consolidated monitoring system
     timer.scheduleFunction(masterMonitor, {}, timer.getTime() + CONFIG.scan_frequency)
     debugMsg("Master monitoring system started - checking every " .. CONFIG.scan_frequency .. " seconds")
-    
+
     -- Start consolidated crate scanning and monitoring
     timer.scheduleFunction(function()
         scanAndMonitorPlayerCrates()
         return timer.getTime() + CONFIG.monitor_frequency
     end, {}, timer.getTime() + CONFIG.monitor_frequency)
     debugMsg("Consolidated crate monitoring started - checking every " .. CONFIG.monitor_frequency .. " seconds")
-    
+
     -- Schedule periodic cleanup of old groups
     timer.scheduleFunction(function()
         cleanupOldGroups()
         return timer.getTime() + 300  -- Run every 5 minutes
     end, {}, timer.getTime() + 300)
-    
+
     AirDropState.initialized = true
 
     debugMsg("Air Drop script loaded successfully!", true)
-    debugMsg("Event-based crate detection active - containers should be detected when spawned", true)
-    debugMsg("Available vehicles: M1 Abrams Tanks, M113 APCs, M1025 HMMWVs", true)
-    
+    debugMsg("Event-based crate detection active - containers should be detected when spawned", false)
+    debugMsg("Available vehicles: M1 Abrams Tanks, M113 APCs, M1025 HMMWVs", false)
+
     if CONFIG.production_mode then
         debugMsg("Running in PRODUCTION MODE - reduced debug output", true)
     end
-    
-    debugMsg("Scan frequency: " .. CONFIG.scan_frequency .. "s, Monitor frequency: " .. CONFIG.monitor_frequency .. "s", true)
+
+    debugMsg("Scan frequency: " .. CONFIG.scan_frequency .. "s, Monitor frequency: " .. CONFIG.monitor_frequency .. "s", false)
 
 end
 
