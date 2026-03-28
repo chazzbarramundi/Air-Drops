@@ -11,8 +11,8 @@
 -- =====================================================================================
 
 local CONFIG = {
-    debug = false,  -- Set to false to disable debug messages
-    production_mode = true,  -- Set to true to reduce overhead and debug output
+    debug = true,  -- Set to false to disable debug messages
+    production_mode = false,  -- Set to true to reduce overhead and debug output
 
     -- Enable features    enable_air_drops = true,  -- Set to false to disable all air drop functionality
     enable_make_command = true,  -- Set to false to disable the "make" command
@@ -347,29 +347,44 @@ local function onEvent(event)
         return
     end
 
-    -- Check for various spawn-related events
-    if event.id == world.event.S_EVENT_BIRTH or 
-       event.id == world.event.S_EVENT_UNIT_LOST or
-       event.id == world.event.S_EVENT_DEAD or
-       event.id == world.event.S_EVENT_PLAYER_ENTER_UNIT then
-
-        local unit = event.initiator or event.target
+    -- Only process specific events we care about
+    if event.id == world.event.S_EVENT_BIRTH then
+        local unit = event.initiator
         if unit and unit:isExist() then
             local unitName = unit:getName()
             local unitTypeName = unit:getTypeName()
 
-            -- Check if this is a crate type and not already tracked (only for birth events)
-            if event.id == world.event.S_EVENT_BIRTH and isPlayerCrateType(unitTypeName, unitName) and not AirDropState.playerCrates[unitName] then
-                -- Add to tracking
-                AirDropState.playerCrates[unitName] = {
-                    unit = unit,
-                    spawnTime = timer.getTime(),
-                    been_airborne = false,
-                    airborne = false,
-                    typeName = unitTypeName,
-                    isStatic = true
-                }
-                debugMsg("✓ Player crate detected via event and added to tracking: " .. unitName .. " (type: " .. unitTypeName .. ")")
+            -- Quick pre-filter: only check likely container types
+            if unitTypeName and 
+               (string.find(unitTypeName, "container") or 
+                string.find(unitTypeName, "cargo") or 
+                string.find(unitTypeName, "crate") or
+                string.find(unitTypeName, "pallet") or
+                unitTypeName == "iso_container" or
+                unitTypeName == "uh1h_cargo") then
+                
+                -- Now do the full check and add if it's a player crate type
+                if isPlayerCrateType(unitTypeName, unitName) and not AirDropState.playerCrates[unitName] then
+                    AirDropState.playerCrates[unitName] = {
+                        unit = unit,
+                        spawnTime = timer.getTime(),
+                        been_airborne = false,
+                        airborne = false,
+                        typeName = unitTypeName,
+                        isStatic = true
+                    }
+                    debugMsg("✓ Player crate detected via event and added to tracking: " .. unitName .. " (type: " .. unitTypeName .. ")")
+                end
+            end
+        end
+    elseif event.id == world.event.S_EVENT_UNIT_LOST or event.id == world.event.S_EVENT_DEAD then
+        -- Handle cleanup of destroyed/lost containers
+        local unit = event.initiator or event.target
+        if unit then
+            local unitName = unit:getName()
+            if unitName and AirDropState.playerCrates[unitName] then
+                AirDropState.playerCrates[unitName] = nil
+                debugMsg("✓ Removed destroyed crate from tracking: " .. unitName)
             end
         end
     end
